@@ -20144,6 +20144,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_activity_history(query)
         if path == "/tasks":
             return self._get_tasks(query)
+        if path == "/tasks/queue/status":
+            import wb_taskqueue
+            return self._json_panel(200, wb_taskqueue.status())
         if path == "/scheduler":
             return self._get_scheduler()
         if path == "/pricing":
@@ -23026,6 +23029,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_account_credits_detail(payload)
         if path == "/tasks/run":
             return self._route_tasks_run(payload)
+        # --- taskcenter seam (our fork) -------------------------------------
+        # 异步队列：把「跑全部账号」从请求线程里搬出去，见 wb_taskqueue.py。
+        # 这三行 + 下面 _route_tasks_queue_* 是本功能在 wb_proxy.py 里的全部接缝。
+        if path == "/tasks/queue/start":
+            return self._route_tasks_queue_start(payload)
+        if path == "/tasks/queue/cancel":
+            import wb_taskqueue
+            return self._json_panel(200, wb_taskqueue.cancel())
+        if path == "/tasks/queue/sweep":
+            return self._route_tasks_queue_sweep(payload)
+        if path == "/tasks/queue/status":
+            import wb_taskqueue
+            return self._json_panel(200, wb_taskqueue.status())
+        # --- end taskcenter seam --------------------------------------------
+
         if path == "/tasks/claim":
             return self._route_tasks_claim(payload)
         if path == "/tasks/travel":
@@ -23173,6 +23191,64 @@ class Handler(BaseHTTPRequestHandler):
             "credits": account.credits
         })
 
+    # --- taskcenter seam (our fork) -----------------------------------------
+    def _taskqueue_targets(self, payload):
+        """解析队列目标账号：支持单账号 uid 或 "all"（默认）。"""
+        if not POOL:
+            return [], "账号池不可用"
+        uid = payload.get("uid")
+        if uid and uid != "all":
+            target = POOL.get(uid)
+            if not target or target.realm != "cn":
+                return [], "未找到指定的国内版账号"
+            return [target], ""
+        targets = POOL.task_accounts("cn")
+        if not targets:
+            return [], "未找到参与任务的国内版账号"
+        return targets, ""
+
+    def _route_tasks_queue_start(self, payload):
+        """POST /tasks/queue/start —— 异步执行成长任务，立刻返回 seq。
+
+        与 /tasks/run 的区别：那个在请求线程里串行跑完全部账号（几分钟，客户端
+        超时重发就会并发两轮）；这个只负责建队列，进度用 /tasks/queue/status 轮询。
+        """
+        if not POOL:
+            return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
+        targets, err = self._taskqueue_targets(payload)
+        if err:
+            return self._json_panel(200, {"ok": False, "msg": err})
+        import wb_taskqueue
+        busy = wb_taskqueue.busy_uids() & {a.uid for a in targets}
+        if busy:
+            return self._json_panel(200, {
+                "ok": False,
+                "msg": "%d 个账号已在队列里，等这一轮跑完再启动" % len(busy)})
+        result = wb_taskqueue.start(targets, payload)
+        if result.get("ok"):
+            add_log_entry("[任务福利] 成长任务队列已启动：%d 个账号，并发 %d"
+                          % (result.get("total", 0), result.get("concurrency", 0)), tag="tasks")
+        return self._json_panel(200, result)
+
+    def _route_tasks_queue_sweep(self, payload):
+        """POST /tasks/queue/sweep —— 只对「进度已达标但没领奖」的任务补领。
+
+        只发 accept / claim 两条幂等请求，不跑任何对话或上报，因此不占队列、也不受
+        风控间隔约束（gap 默认 0.5 秒）。
+        """
+        if not POOL:
+            return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
+        targets, err = self._taskqueue_targets(payload)
+        if err:
+            return self._json_panel(200, {"ok": False, "msg": err})
+        import wb_taskqueue
+        stats = wb_taskqueue.sweep(targets, gap=payload.get("gap", 0.5))
+        add_log_entry("[任务福利] 补领扫描：%d 个账号，补领 %d 个任务，+%s 积分"
+                      % (stats.get("accounts", 0), stats.get("claimed", 0),
+                         stats.get("credit", 0)), tag="tasks")
+        return self._json_panel(200, stats)
+    # --- end taskcenter seam ------------------------------------------------
+
     def _route_tasks_run(self, payload):
         if not POOL:
             return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
@@ -23188,6 +23264,13 @@ class Handler(BaseHTTPRequestHandler):
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
+        import wb_taskqueue
+        # 队列入口与手动入口互斥：两边同时跑同一账号会互相顶乱进度（上报不幂等）。
+        busy = wb_taskqueue.busy_uids() & {a.uid for a in targets}
+        if busy:
+            return self._json_panel(200, {
+                "ok": False,
+                "msg": "%d 个账号正在任务队列里跑，等队列结束或先取消再手动执行" % len(busy)})
         claim = payload.get("claim", True) is not False
         combined_logs = []
         total_credit = 0

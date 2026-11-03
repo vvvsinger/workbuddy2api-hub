@@ -706,6 +706,18 @@ def do_cat_travel(account):
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
 
 
+def _notify(progress, task, phase):
+    """调用外部进度回调；回调里抛什么都不能打断任务执行。"""
+    if not progress:
+        return
+    try:
+        progress(task.get("task_code") or "",
+                 task.get("name") or task.get("title") or "",
+                 phase)
+    except Exception:
+        pass
+
+
 def _progress_one(account, t, logs, gap, claim=True):
     """推进单个任务并返回本次到账积分。
 
@@ -990,11 +1002,15 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
     return {"ok": True, "logs": logs, "earned_credit": total_earned}
 
 
-def run_growth_tasks(account, gap=1.0, claim=True):
+def run_growth_tasks(account, gap=1.0, claim=True, progress=None):
     """完整执行批量成长任务点亮与领奖。
 
     claim=False 只推进进度、不领奖，让用户自己挑时间领取（#507）。
+    progress: 可选回调 `(task_code, task_name, phase)`，phase 取 "start" / "done"。
+              给 `wb_taskqueue` 的队列喂实时进度用；不传时行为与原来完全一致
+              （这也是它被做成可选参数、而不是重构这个函数的原因）。
     """
+
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": []}
     if getattr(account, "is_enterprise", lambda: False)():
@@ -1056,7 +1072,10 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     for t in tasks:
         if t.get("task_type") == "auto":
             continue
+        _notify(progress, t, "start")
         total_earned += _progress_one(account, t, logs, gap, claim=claim)
+        _notify(progress, t, "done")
+
 
     # 2b. 运行微信小程序链式成长任务（Sequential_Tasks 系列）
     try:
